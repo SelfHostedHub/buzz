@@ -1,0 +1,185 @@
+name: Sync Upstream Code and Releases and Build New Releases
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    env:
+      UPSTREAM_REPO: kennyparsons/buzz
+      MY_REPO: selfhostedhub/buzz
+      PAT: ${{ secrets.PAT }}
+
+    outputs:
+      new_tag: ${{ steps.create_new_tag.outputs.new_tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Fetch tags
+        run: git fetch --tags
+
+      - name: Add Upstream Remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || echo "Upstream already added."
+          git fetch upstream
+
+      - name: Backup sh-sync-and-build.yml
+        run: |
+          mkdir -p /tmp/workflow-backup
+          cp .github/workflows/sh-sync-and-build.yml /tmp/workflow-backup/sh-sync-and-build.yml || echo "File does not exist"
+
+      - name: Sync with upstream and hard reset
+        run: |
+          git fetch upstream
+          git reset --hard upstream/$(git branch --show-current)
+          echo "synced=true" >> $GITHUB_ENV
+
+      - name: Force push to origin
+        run: |
+          git push --force https://${{ secrets.PAT }}@github.com/${{ env.MY_REPO }}.git $(git branch --show-current)
+
+      - name: Restore sh-sync-and-build.yml
+        run: |
+          mkdir -p .github/workflows
+          cp /tmp/workflow-backup/sh-sync-and-build.yml .github/workflows/sh-sync-and-build.yml || echo "No backup found"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .github/workflows/sh-sync-and-build.yml
+          git commit -m "Restore sh-sync-and-build.yml" || echo "No changes to commit"
+          git push https://${{ secrets.PAT }}@github.com/${{ env.MY_REPO }}.git $(git branch --show-current)
+
+      - name: Determine next tag
+        id: next_tag
+        run: |
+          # Get the latest tag
+          LATEST_TAG=$(git describe --tags `git rev-list --tags --max-count=1` 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            # No tags exist, start with 1.0.0
+            NEXT_TAG="1.0.0"
+            echo "next_tag=$NEXT_TAG" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          # Get the list of commits since the latest tag
+          COMMITS=$(git log $LATEST_TAG..HEAD --oneline)
+          COMMIT_COUNT=$(echo "$COMMITS" | wc -l)
+          
+          # Initialize version increments
+          MAJOR=0
+          MINOR=0
+          PATCH=0
+          
+          # Determine the type of version increment
+          if [ $COMMIT_COUNT -le 5 ]; then
+            PATCH=1
+          elif [ $COMMIT_COUNT -le 100 ]; then
+            MINOR=1
+          else
+            MAJOR=1
+          fi
+          
+          # Parse the latest tag
+          IFS='.' read -r -a parts <<< "$LATEST_TAG"
+          major=${parts[0]}
+          minor=${parts[1]}
+          patch=${parts[2]}
+          
+          # Calculate the new version
+          if [ $MAJOR -gt 0 ]; then
+            major=$((major + 1))
+            minor=0
+            patch=0
+          elif [ $MINOR -gt 0 ]; then
+            minor=$((minor + 1))
+            patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          
+          NEXT_TAG="${major}.${minor}.${patch}"
+          
+          echo "next_tag=$NEXT_TAG" >> $GITHUB_ENV
+
+      - name: Create new tag and push
+        id: create_new_tag
+        run: |
+          NEXT_TAG=${{ env.next_tag }}
+          git tag $NEXT_TAG
+          git push https://${{ secrets.PAT }}@github.com/${{ env.MY_REPO }}.git $NEXT_TAG
+          echo "new_tag=$NEXT_TAG" >> $GITHUB_ENV
+
+      - name: Create release if new tag
+        if: env.new_tag != ''
+        run: |
+          TAG=${{ env.new_tag }}
+          COMMIT=$(git rev-list -n 1 $TAG)
+          DESCRIPTION=$(git log -1 --pretty=%B)
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ env.MY_REPO }}/releases \
+            -d '{"tag_name":"'"$TAG"'","target_commitish":"'"$COMMIT"'","name":"'"$TAG"'","body":"'"$DESCRIPTION"'","draft":false,"prerelease":false}'
+
+  build:
+    needs: sync
+    runs-on: self-hosted
+    if: needs.sync.outputs.new_tag != '' && needs.sync.outputs.new_tag != null
+    permissions:
+      packages: write
+      contents: read
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+
+    steps:
+      - name: Debug  
+        run: echo "Tag from sync job is ${{ needs.sync.outputs.new_tag }}"
+      - uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Extract Builder meta
+        id: builder-meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ghcr.io/SelfHostedHub/buzz
+          tags: |
+            type=raw,value=${{ needs.sync.outputs.new_tag }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            latest
+
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.PAT }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true  
+          tags: ${{ steps.builder-meta.outputs.tags }}
+          labels: ${{ steps.builder-meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ github.repository }}
+          cache-to: type=gha,scope=${{ github.repository }},mode=max
