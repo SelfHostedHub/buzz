@@ -35,22 +35,39 @@ jobs:
           git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || echo "Upstream already added."
           git fetch upstream
 
+      - name: Check for upstream changes
+        id: check_upstream
+        run: |
+          git fetch upstream
+          UPSTREAM_COMMIT=$(git rev-parse upstream/$(git branch --show-current))
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          if [ "$UPSTREAM_COMMIT" != "$LOCAL_COMMIT" ]; then
+            echo "upstream_changes=true" >> $GITHUB_ENV
+            echo "::set-output name=upstream_changes::true"
+          else:
+            echo "upstream_changes=false" >> $GITHUB_ENV
+            echo "::set-output name=upstream_changes::false"
+
       - name: Backup sh-sync-and-build.yml
+        if: env.upstream_changes == 'true'
         run: |
           mkdir -p /tmp/workflow-backup
           cp .github/workflows/sh-sync-and-build.yml /tmp/workflow-backup/sh-sync-and-build.yml || echo "File does not exist"
 
       - name: Sync with upstream and hard reset
+        if: env.upstream_changes == 'true'
         run: |
           git fetch upstream
           git reset --hard upstream/$(git branch --show-current)
           echo "synced=true" >> $GITHUB_ENV
 
       - name: Force push to origin
+        if: env.upstream_changes == 'true'
         run: |
           git push --force https://${{ secrets.PAT }}@github.com/${{ env.MY_REPO }}.git $(git branch --show-current)
 
       - name: Restore sh-sync-and-build.yml
+        if: env.upstream_changes == 'true'
         run: |
           mkdir -p .github/workflows
           cp /tmp/workflow-backup/sh-sync-and-build.yml .github/workflows/sh-sync-and-build.yml || echo "No backup found"
@@ -62,6 +79,7 @@ jobs:
 
       - name: Determine next tag
         id: next_tag
+        if: env.upstream_changes == 'true'
         run: |
           # Get the latest tag
           LATEST_TAG=$(git describe --tags `git rev-list --tags --max-count=1` 2>/dev/null || echo "")
@@ -114,6 +132,7 @@ jobs:
 
       - name: Create new tag and push
         id: create_new_tag
+        if: env.upstream_changes == 'true'
         run: |
           NEXT_TAG=${{ env.next_tag }}
           git tag $NEXT_TAG
@@ -121,6 +140,7 @@ jobs:
           echo "new_tag=$NEXT_TAG" >> $GITHUB_ENV
 
       - name: Create release if new tag
+        id: create_release
         if: env.new_tag != ''
         run: |
           TAG=${{ env.new_tag }}
@@ -131,6 +151,7 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ env.MY_REPO }}/releases \
             -d '{"tag_name":"'"$TAG"'","target_commitish":"'"$COMMIT"'","name":"'"$TAG"'","body":"'"$DESCRIPTION"'","draft":false,"prerelease":false}'
+          echo "release_created=true" >> $GITHUB_ENV
 
   build:
     needs: sync
@@ -143,7 +164,7 @@ jobs:
       DOCKER_HOST: unix:///var/run/docker.sock
 
     steps:
-      - name: Debug  
+      - name: Debug
         run: echo "Tag from sync job is ${{ needs.sync.outputs.new_tag }}"
       - uses: actions/checkout@v2
         with:
@@ -178,7 +199,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true  
+          push: true
           tags: ${{ steps.builder-meta.outputs.tags }}
           labels: ${{ steps.builder-meta.outputs.labels }}
           cache-from: type=gha,scope=${{ github.repository }}
